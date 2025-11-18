@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os, socket, base64, logging, json
+import os, socket, base64, logging, json, hashlib
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import mysql.connector
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Response, Header
 from fastapi import Query, Path
 import uvicorn
 from models.health import Health
@@ -74,6 +74,22 @@ def decode_cursor(cursor: Optional[str]) -> int:
         return int(base64.urlsafe_b64decode(cursor.encode()).decode())
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid cursor")
+
+def make_etag(row: dict) -> str:
+    """Generate a deterministic strong ETag from id + updated_at."""
+    updated = row.get("updated_at")
+    if isinstance(updated, datetime):
+        stamp = updated.isoformat(timespec="microseconds")
+    else:
+        stamp = str(updated)
+    payload = f"{row.get('id')}|{stamp}"
+    digest = hashlib.sha1(payload.encode()).hexdigest()
+    return f'"{digest}"'
+
+def parse_etag_header(header_value: Optional[str]) -> List[str]:
+    if not header_value:
+        return []
+    return [part.strip() for part in header_value.split(",") if part.strip()]
 
 # -------------------------------------------------------------------
 # Schema bootstrap (id as CHAR(36), tags JSON)
@@ -459,17 +475,39 @@ def create_app_feedback(payload: AppFeedbackCreate):
     return row_to_app_out(row)
 
 @app.get("/feedback/app/{id}", response_model=AppFeedbackOut)
-def get_app_feedback(id: UUID = Path(...)):
+def get_app_feedback(
+    response: Response,
+    id: UUID = Path(...),
+    if_none_match: Optional[str] = Header(default=None),
+):
     row = run("SELECT * FROM feedback_app WHERE id=%s", (str(id),), fetch="one")
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
+
+    etag = make_etag(row)
+    tag_list = parse_etag_header(if_none_match)
+    if if_none_match and (if_none_match.strip() == "*" or etag in tag_list):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
+
+    response.headers["ETag"] = etag
     return row_to_app_out(row)
 
 @app.patch("/feedback/app/{id}", response_model=AppFeedbackOut)
-def update_app_feedback(payload: AppFeedbackUpdate, id: UUID = Path(...)):
+def update_app_feedback(
+    response: Response,
+    payload: AppFeedbackUpdate,
+    id: UUID = Path(...),
+    if_match: Optional[str] = Header(default=None),
+):
     existing = run("SELECT * FROM feedback_app WHERE id=%s", (str(id),), fetch="one")
     if not existing:
         raise HTTPException(status_code=404, detail="Not found")
+
+    current_etag = make_etag(existing)
+    if if_match:
+        tag_list = parse_etag_header(if_match)
+        if if_match.strip() != "*" and current_etag not in tag_list:
+            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="If-Match precondition failed")
 
     fields, params = [], []
     def setf(col, val): fields.append(f"{col}=%s"); params.append(val)
@@ -497,12 +535,15 @@ def update_app_feedback(payload: AppFeedbackUpdate, id: UUID = Path(...)):
         setf("tags", None if tags is None else json.dumps(tags))
 
     if not fields:
+        response.headers["ETag"] = current_etag
         return row_to_app_out(existing)
 
     params.append(str(id))
     sql = f"UPDATE feedback_app SET {', '.join(fields)}, updated_at=NOW(6) WHERE id=%s"
     run(sql, tuple(params))
     row = run("SELECT * FROM feedback_app WHERE id=%s", (str(id),), fetch="one")
+    new_etag = make_etag(row)
+    response.headers["ETag"] = new_etag
     return row_to_app_out(row)
 
 @app.delete("/feedback/app/{id}", status_code=status.HTTP_204_NO_CONTENT)
