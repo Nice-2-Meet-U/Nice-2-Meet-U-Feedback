@@ -39,7 +39,7 @@ Returns uptime metadata, host IP, UTC timestamp, and echoes (query/path) for con
 - `DELETE /feedback/profile/{id}`
   - Removes the record (204 on success).
 - `GET /feedback/profile`
-  - Query params: filter by `reviewee_profile_id`, `reviewer_profile_id`, `match_id`, `tags` (comma-separated OR), `min_overall`, `max_overall`, `since`, plus cursor-based pagination (`limit`, `cursor`, `sort`, `order`).
+  - Query params: filter by `reviewee_profile_id`, `reviewer_profile_id`, `match_id`, `tags` (comma-separated OR), `min_overall`, `max_overall`, `since`, `search` (headline/comment contains), plus cursor-based pagination (`limit`, `cursor`, `sort`, `order`).
   - Response: `{"items": [...ProfileFeedbackOut], "next_cursor": "...", "count": N}`.
 - `GET /feedback/profile/stats`
   - Query params: `reviewee_profile_id` (required), optional `tags`, `since`.
@@ -56,13 +56,13 @@ Returns uptime metadata, host IP, UTC timestamp, and echoes (query/path) for con
 - `DELETE /feedback/app/{id}`
   - Removes the entry (204).
 - `GET /feedback/app`
-  - Query params: `author_profile_id`, `tags`, ratings filters, `since`, pagination controls.
-  - Response mirrors the profile list shape.
+  - Query params: `author_profile_id`, `tags`, ratings filters, `since`, `search`, sorting, and pagination controls (either cursor or explicit `offset` with `limit`).
+  - Response mirrors the profile list shape but also includes a `pagination` object with `limit`, `offset`, `total`, and navigation helpers.
 - `GET /feedback/app/stats`
   - Aggregates totals, rating distribution, facet averages, and tag counts (all optional filters except none required).
 
 ## Development Notes
 - All UUIDs are stored as `CHAR(36)` strings; convert to/from `uuid.UUID` when instantiating Pydantic models.
 - `tags` insert/update paths use `json.dumps` and `_coerce_tags` ensures outbound data is always `list[str]`.
-- The service uses simple base64 cursor pagination—offset encoded/decoded per request.
+- Collection pagination defaults to base64 cursoring for backwards compatibility, while the app feedback listing also supports explicit limit/offset metadata for page-based clients.
 - Tests can be written with `pytest` (see `requirements.txt`).

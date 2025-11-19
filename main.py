@@ -334,6 +334,11 @@ def list_profile_feedback(
     min_overall: Optional[int] = Query(default=None, ge=1, le=5),
     max_overall: Optional[int] = Query(default=None, ge=1, le=5),
     since: Optional[datetime] = Query(default=None),
+    search: Optional[str] = Query(
+        default=None,
+        min_length=1,
+        description="Case-insensitive search across headline/comment content",
+    ),
     sort: str = Query(default="created_at", pattern="^(created_at|overall_experience)$"),
     order: str = Query(default="desc", pattern="^(asc|desc)$"),
     limit: int = Query(default=20, ge=1, le=100),
@@ -352,6 +357,10 @@ def list_profile_feedback(
         if tag_list:
             where.append("(" + " OR ".join(["JSON_SEARCH(tags, 'one', %s) IS NOT NULL"] * len(tag_list)) + ")")
             params.extend(tag_list)
+    if search:
+        pattern = f"%{search.lower()}%"
+        where.append("(LOWER(COALESCE(headline, '')) LIKE %s OR LOWER(COALESCE(comment, '')) LIKE %s)")
+        params.extend([pattern, pattern])
 
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
@@ -558,10 +567,19 @@ def list_app_feedback(
     min_overall: Optional[int] = Query(default=None, ge=1, le=5),
     max_overall: Optional[int] = Query(default=None, ge=1, le=5),
     since: Optional[datetime] = Query(default=None),
+    search: Optional[str] = Query(
+        default=None,
+        min_length=1,
+        description="Case-insensitive search across headline/comment content",
+    ),
     sort: str = Query(default="created_at", pattern="^(created_at|overall)$"),
     order: str = Query(default="desc", pattern="^(asc|desc)$"),
     limit: int = Query(default=20, ge=1, le=100),
-    cursor: Optional[str] = Query(default=None),
+    offset: int = Query(default=0, ge=0, description="Zero-based offset for pagination"),
+    cursor: Optional[str] = Query(
+        default=None,
+        description="Base64 cursor (takes precedence over offset for backwards compatibility)",
+    ),
 ):
     where, params = [], []
     if author_profile_id: where.append("author_profile_id=%s"); params.append(str(author_profile_id))
@@ -573,12 +591,16 @@ def list_app_feedback(
         if tag_list:
             where.append("JSON_OVERLAPS(tags, CAST(%s AS JSON))")
             params.append(str(tag_list).replace("'", '"'))
+    if search:
+        pattern = f"%{search.lower()}%"
+        where.append("(LOWER(COALESCE(headline, '')) LIKE %s OR LOWER(COALESCE(comment, '')) LIKE %s)")
+        params.extend([pattern, pattern])
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     order_col = "created_at" if sort == "created_at" else "overall"
     order_sql = "ASC" if order == "asc" else "DESC"
 
-    offset = decode_cursor(cursor)
+    effective_offset = decode_cursor(cursor) if cursor else offset
     rows = run(
         f"""
         SELECT * FROM feedback_app
@@ -586,12 +608,32 @@ def list_app_feedback(
         ORDER BY {order_col} {order_sql}, id {order_sql}
         LIMIT %s OFFSET %s
         """,
-        tuple(params + [limit, offset]),
+        tuple(params + [limit, effective_offset]),
         fetch="all",
     )
-    next_cursor = encode_cursor(offset + len(rows)) if len(rows) == limit else None
+    total_row = run(
+        f"SELECT COUNT(*) AS total FROM feedback_app {where_sql}",
+        tuple(params),
+        fetch="one",
+    )
+    total = total_row["total"] if total_row else 0
+    next_cursor = encode_cursor(effective_offset + len(rows)) if len(rows) == limit else None
     items = [row_to_app_out(r) for r in rows]
-    return {"items": items, "next_cursor": next_cursor, "count": len(items)}
+    has_next = (effective_offset + len(rows)) < total
+    previous_offset = max(effective_offset - limit, 0) if effective_offset > 0 else None
+    next_offset = effective_offset + limit if has_next else None
+    pagination = {
+        "limit": limit,
+        "offset": effective_offset,
+        "count": len(items),
+        "total": total,
+        "has_next": has_next,
+        "has_previous": effective_offset > 0,
+        "next_offset": next_offset,
+        "previous_offset": previous_offset,
+        "next_cursor": next_cursor,
+    }
+    return {"items": items, "next_cursor": next_cursor, "count": len(items), "pagination": pagination}
 
 @app.get("/feedback/app/stats", response_model=Dict[str, object])
 def app_feedback_stats(
