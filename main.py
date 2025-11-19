@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import mysql.connector
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, status, Response, Header
 from fastapi import Query, Path
 import uvicorn
@@ -151,7 +152,22 @@ async def lifespan(app: FastAPI):
         logger.error(f"DB startup check: FAILED ({e})")
     yield
 
-app = FastAPI(title="Feedback Microservice", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="Feedback Microservice",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# allow whatever origins you expect (localhost:3000 in dev, prod domains later)
+allowed_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in allowed_origins],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -------------------------------------------------------------------
 # Health
