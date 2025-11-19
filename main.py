@@ -4,6 +4,7 @@ import os, socket, base64, logging, json, hashlib
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
+from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
 # NEW: load environment variables from .env
@@ -12,7 +13,7 @@ load_dotenv()
 
 import mysql.connector
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, HTTPException, status, Response, Header
+from fastapi import FastAPI, HTTPException, status, Response, Header, Request
 from fastapi import Query, Path
 import uvicorn
 from models.health import Health
@@ -91,6 +92,99 @@ def parse_etag_header(header_value: Optional[str]) -> List[str]:
     if not header_value:
         return []
     return [part.strip() for part in header_value.split(",") if part.strip()]
+
+QueryItems = List[Tuple[str, str]]
+
+def ensure_relative_path(path: str) -> str:
+    return path if path.startswith("/") else f"/{path}"
+
+def make_relative_url(path: str, items: Optional[QueryItems] = None) -> str:
+    relative_path = ensure_relative_path(path)
+    if not items:
+        return relative_path
+    query = urlencode(items, doseq=True)
+    return f"{relative_path}?{query}" if query else relative_path
+
+def query_items_from_request(request: Request) -> QueryItems:
+    return [(k, v) for k, v in request.query_params.multi_items()]
+
+def override_query_items(items: QueryItems, overrides: Dict[str, Optional[str]]) -> QueryItems:
+    skip = set(overrides.keys())
+    updated = [(k, v) for (k, v) in items if k not in skip]
+    for key, value in overrides.items():
+        if value is None:
+            continue
+        updated.append((key, str(value)))
+    return updated
+
+def build_profile_links(row: dict) -> Dict[str, str]:
+    resource_id = str(row["id"])
+    reviewer_id = str(row["reviewer_profile_id"])
+    reviewee_id = str(row["reviewee_profile_id"])
+    match_id = row.get("match_id")
+    links: Dict[str, str] = {
+        "self": make_relative_url(f"/feedback/profile/{resource_id}"),
+        "collection": ensure_relative_path("/feedback/profile"),
+        "reviewee_feedback": make_relative_url(
+            "/feedback/profile", [("reviewee_profile_id", reviewee_id)]
+        ),
+        "reviewer_feedback": make_relative_url(
+            "/feedback/profile", [("reviewer_profile_id", reviewer_id)]
+        ),
+        "stats": make_relative_url(
+            "/feedback/profile/stats", [("reviewee_profile_id", reviewee_id)]
+        ),
+    }
+    if match_id:
+        links["match_feedback"] = make_relative_url(
+            "/feedback/profile", [("match_id", str(match_id))]
+        )
+    return links
+
+def build_app_links(row: dict) -> Dict[str, str]:
+    resource_id = str(row["id"])
+    author_id = row.get("author_profile_id")
+    links: Dict[str, str] = {
+        "self": make_relative_url(f"/feedback/app/{resource_id}"),
+        "collection": ensure_relative_path("/feedback/app"),
+        "stats": make_relative_url("/feedback/app/stats"),
+    }
+    if author_id:
+        links["author_feedback"] = make_relative_url(
+            "/feedback/app", [("author_profile_id", str(author_id))]
+        )
+    return links
+
+def build_collection_links(
+    path: str,
+    base_items: QueryItems,
+    *,
+    next_cursor: Optional[str] = None,
+    prev_cursor: Optional[str] = None,
+    next_offset: Optional[int] = None,
+    prev_offset: Optional[int] = None,
+) -> Dict[str, str]:
+    links: Dict[str, str] = {
+        "self": make_relative_url(path, base_items),
+        "collection": ensure_relative_path(path),
+    }
+    if next_cursor:
+        links["next"] = make_relative_url(
+            path, override_query_items(base_items, {"cursor": next_cursor, "offset": None})
+        )
+    elif next_offset is not None:
+        links["next"] = make_relative_url(
+            path, override_query_items(base_items, {"offset": str(next_offset), "cursor": None})
+        )
+    if prev_cursor:
+        links["prev"] = make_relative_url(
+            path, override_query_items(base_items, {"cursor": prev_cursor, "offset": None})
+        )
+    elif prev_offset is not None:
+        links["prev"] = make_relative_url(
+            path, override_query_items(base_items, {"offset": str(prev_offset), "cursor": None})
+        )
+    return links
 
 # -------------------------------------------------------------------
 # Schema bootstrap (id as CHAR(36), tags JSON)
@@ -228,6 +322,7 @@ def row_to_profile_out(r: dict) -> ProfileFeedbackOut:
         headline=r["headline"],
         comment=r["comment"],
         tags=_coerce_tags(r["tags"]),
+        links=build_profile_links(r),
     )
 
 def row_to_app_out(r: dict) -> AppFeedbackOut:
@@ -244,6 +339,7 @@ def row_to_app_out(r: dict) -> AppFeedbackOut:
         headline=r["headline"],
         comment=r["comment"],
         tags=_coerce_tags(r["tags"]),
+        links=build_app_links(r),
     )
 
 # -------------------------------------------------------------------
@@ -343,6 +439,7 @@ def delete_profile_feedback(id: UUID = Path(...)):
 
 @app.get("/feedback/profile", response_model=Dict[str, object])
 def list_profile_feedback(
+    request: Request,
     reviewee_profile_id: Optional[UUID] = Query(default=None),
     reviewer_profile_id: Optional[UUID] = Query(default=None),
     match_id: Optional[UUID] = Query(default=None),
@@ -397,10 +494,19 @@ def list_profile_feedback(
     # next_cursor if there might be more (cheap check by fetching one more? keep simple: compute count of page)
     next_cursor = encode_cursor(offset + len(rows)) if len(rows) == limit else None
     items = [row_to_profile_out(r) for r in rows]
-    return {"items": items, "next_cursor": next_cursor, "count": len(items)}
+    query_items = query_items_from_request(request)
+    prev_cursor = encode_cursor(max(offset - limit, 0)) if offset > 0 else None
+    links = build_collection_links(
+        request.url.path,
+        query_items,
+        next_cursor=next_cursor,
+        prev_cursor=prev_cursor,
+    )
+    return {"items": items, "next_cursor": next_cursor, "count": len(items), "links": links}
 
 @app.get("/feedback/profile/stats", response_model=Dict[str, object])
 def profile_feedback_stats(
+    request: Request,
     reviewee_profile_id: UUID = Query(...),
     tags: Optional[str] = Query(default=None),
     since: Optional[datetime] = Query(default=None),
@@ -434,6 +540,11 @@ def profile_feedback_stats(
     )
 
     total = agg["total"] or 0
+    query_items = query_items_from_request(request)
+    stats_links = {
+        "self": make_relative_url(request.url.path, query_items),
+        "related_feedback": make_relative_url("/feedback/profile", query_items),
+    }
     if total == 0:
         return {
             "reviewee_profile_id": reviewee_profile_id,
@@ -442,6 +553,7 @@ def profile_feedback_stats(
             "distribution_overall_experience": {str(k): 0 for k in range(1,6)},
             "facet_averages": {"safety_feeling": None, "respectfulness": None},
             "top_tags": [],
+            "links": stats_links,
         }
 
     # Top tags via JSON_TABLE (MySQL 8+)
@@ -472,6 +584,7 @@ def profile_feedback_stats(
             "respectfulness": round(float(agg["avg_respect"]), 3) if agg["avg_respect"] is not None else None,
         },
         "top_tags": [{"tag": r["tag"], "count": int(r["cnt"])} for r in top_tags],
+        "links": stats_links,
     }
 
 # -------------------------------------------------------------------
@@ -578,6 +691,7 @@ def delete_app_feedback(id: UUID = Path(...)):
 
 @app.get("/feedback/app", response_model=Dict[str, object])
 def list_app_feedback(
+    request: Request,
     author_profile_id: Optional[UUID] = Query(default=None),
     tags: Optional[str] = Query(default=None, description="Comma-separated list; OR semantics"),
     min_overall: Optional[int] = Query(default=None, ge=1, le=5),
@@ -649,10 +763,30 @@ def list_app_feedback(
         "previous_offset": previous_offset,
         "next_cursor": next_cursor,
     }
-    return {"items": items, "next_cursor": next_cursor, "count": len(items), "pagination": pagination}
+    query_items = query_items_from_request(request)
+    use_cursor = cursor is not None
+    prev_cursor = (
+        encode_cursor(max(effective_offset - limit, 0)) if use_cursor and effective_offset > 0 else None
+    )
+    links = build_collection_links(
+        request.url.path,
+        query_items,
+        next_cursor=next_cursor if use_cursor else None,
+        prev_cursor=prev_cursor,
+        next_offset=None if use_cursor else next_offset,
+        prev_offset=None if use_cursor else previous_offset,
+    )
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+        "count": len(items),
+        "pagination": pagination,
+        "links": links,
+    }
 
 @app.get("/feedback/app/stats", response_model=Dict[str, object])
 def app_feedback_stats(
+    request: Request,
     tags: Optional[str] = Query(default=None),
     since: Optional[datetime] = Query(default=None),
 ):
@@ -686,6 +820,11 @@ def app_feedback_stats(
         fetch="one",
     )
     total = agg["total"] or 0
+    query_items = query_items_from_request(request)
+    stats_links = {
+        "self": make_relative_url(request.url.path, query_items),
+        "related_feedback": make_relative_url("/feedback/app", query_items),
+    }
     if total == 0:
         return {
             "count_total": 0,
@@ -693,6 +832,7 @@ def app_feedback_stats(
             "distribution_overall": {str(k): 0 for k in range(1,6)},
             "facet_averages": {"usability": None, "reliability": None, "performance": None, "support_experience": None},
             "top_tags": [],
+            "links": stats_links,
         }
 
     top_tags = run(
@@ -723,6 +863,7 @@ def app_feedback_stats(
             "support_experience": round(float(agg["avg_support"]), 3) if agg["avg_support"] is not None else None,
         },
         "top_tags": [{"tag": r["tag"], "count": int(r["cnt"])} for r in top_tags],
+        "links": stats_links,
     }
 
 # -------------------------------------------------------------------

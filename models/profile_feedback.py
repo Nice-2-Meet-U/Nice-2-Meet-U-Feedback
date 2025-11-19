@@ -17,7 +17,7 @@ Notes:
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, model_validator
@@ -195,6 +195,10 @@ class ProfileFeedbackOut(ProfileFeedbackBase):
     )
     updated_at: datetime = Field(
         default_factory=datetime.utcnow, description="Last update timestamp (UTC)"
+    )
+    links: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Relative links to this resource and related sub-resources",
     )
 
     model_config = {
