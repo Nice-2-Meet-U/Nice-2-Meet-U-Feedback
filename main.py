@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import os, socket, base64, logging, json, hashlib
+import os, socket, base64, logging, json, hashlib, time, random, threading
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
@@ -13,7 +13,15 @@ load_dotenv()
 
 import mysql.connector
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, HTTPException, status, Response, Header, Request
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    HTTPException,
+    status,
+    Response,
+    Header,
+    Request,
+)
 from fastapi import Query, Path
 import uvicorn
 from models.health import Health
@@ -22,6 +30,10 @@ from models.profile_feedback import (
 )
 from models.app_feedback import (
     AppFeedbackCreate, AppFeedbackOut, AppFeedbackUpdate
+)
+from models.feedback_job import (
+    FeedbackAnalysisJobRequest,
+    FeedbackAnalysisJobStatus,
 )
 
 # -------------------------------------------------------------------
@@ -186,6 +198,252 @@ def build_collection_links(
         )
     return links
 
+def parse_tags_param(raw: Optional[str]) -> Optional[List[str]]:
+    if not raw:
+        return None
+    tags = [token.strip().lower() for token in raw.split(",") if token.strip()]
+    return tags or None
+
+
+def gather_profile_stats_data(
+    reviewee_profile_id: str,
+    since: Optional[datetime],
+    tags: Optional[List[str]],
+) -> Dict[str, Any]:
+    where, params = ["reviewee_profile_id=%s"], [reviewee_profile_id]
+    if since:
+        where.append("created_at >= %s"); params.append(since)
+    if tags:
+        where.append("JSON_OVERLAPS(tags, CAST(%s AS JSON))")
+        params.append(json.dumps(tags))
+    where_sql = "WHERE " + " AND ".join(where)
+    agg = run(
+        f"""
+        SELECT
+          COUNT(*) AS total,
+          AVG(overall_experience) AS avg_overall,
+          SUM(overall_experience=1) AS d1,
+          SUM(overall_experience=2) AS d2,
+          SUM(overall_experience=3) AS d3,
+          SUM(overall_experience=4) AS d4,
+          SUM(overall_experience=5) AS d5,
+          AVG(NULLIF(safety_feeling,0)) AS avg_safety,
+          AVG(NULLIF(respectfulness,0)) AS avg_respect
+        FROM feedback_profile
+        {where_sql}
+        """,
+        tuple(params),
+        fetch="one",
+    )
+    total = int(agg["total"] or 0)
+    base = {
+        "reviewee_profile_id": UUID(reviewee_profile_id),
+        "count_total": total,
+        "avg_overall_experience": round(float(agg["avg_overall"]), 3) if agg["avg_overall"] is not None else None,
+        "distribution_overall_experience": {
+            "1": int(agg["d1"] or 0), "2": int(agg["d2"] or 0), "3": int(agg["d3"] or 0),
+            "4": int(agg["d4"] or 0), "5": int(agg["d5"] or 0)
+        },
+        "facet_averages": {
+            "safety_feeling": round(float(agg["avg_safety"]), 3) if agg["avg_safety"] is not None else None,
+            "respectfulness": round(float(agg["avg_respect"]), 3) if agg["avg_respect"] is not None else None,
+        },
+        "top_tags": [],
+    }
+    if total == 0:
+        return base
+    top_tags = run(
+        f"""
+        SELECT jt.tag AS tag, COUNT(*) AS cnt
+        FROM feedback_profile fp,
+             JSON_TABLE(fp.tags, '$[*]' COLUMNS(tag VARCHAR(64) PATH '$')) jt
+        {where_sql.replace('feedback_profile', 'fp')}
+        GROUP BY jt.tag
+        ORDER BY cnt DESC, jt.tag ASC
+        LIMIT 10
+        """,
+        tuple(params),
+        fetch="all",
+    ) or []
+    base["top_tags"] = [{"tag": r["tag"], "count": int(r["cnt"])} for r in top_tags]
+    return base
+
+
+def gather_app_stats_data(
+    tags: Optional[List[str]],
+    since: Optional[datetime],
+) -> Dict[str, Any]:
+    where, params = [], []
+    if since:
+        where.append("created_at >= %s"); params.append(since)
+    if tags:
+        where.append("JSON_OVERLAPS(tags, CAST(%s AS JSON))")
+        params.append(json.dumps(tags))
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    agg = run(
+        f"""
+        SELECT
+          COUNT(*) AS total,
+          AVG(overall) AS avg_overall,
+          SUM(overall=1) AS d1,
+          SUM(overall=2) AS d2,
+          SUM(overall=3) AS d3,
+          SUM(overall=4) AS d4,
+          SUM(overall=5) AS d5,
+          AVG(NULLIF(usability,0)) AS avg_usability,
+          AVG(NULLIF(reliability,0)) AS avg_reliability,
+          AVG(NULLIF(performance,0)) AS avg_performance,
+          AVG(NULLIF(support_experience,0)) AS avg_support
+        FROM feedback_app
+        {where_sql}
+        """,
+        tuple(params),
+        fetch="one",
+    )
+    total = int(agg["total"] or 0)
+    base = {
+        "count_total": total,
+        "avg_overall": round(float(agg["avg_overall"]), 3) if agg["avg_overall"] is not None else None,
+        "distribution_overall": {
+            "1": int(agg["d1"] or 0), "2": int(agg["d2"] or 0), "3": int(agg["d3"] or 0),
+            "4": int(agg["d4"] or 0), "5": int(agg["d5"] or 0)
+        },
+        "facet_averages": {
+            "usability": round(float(agg["avg_usability"]), 3) if agg["avg_usability"] is not None else None,
+            "reliability": round(float(agg["avg_reliability"]), 3) if agg["avg_reliability"] is not None else None,
+            "performance": round(float(agg["avg_performance"]), 3) if agg["avg_performance"] is not None else None,
+            "support_experience": round(float(agg["avg_support"]), 3) if agg["avg_support"] is not None else None,
+        },
+        "top_tags": [],
+    }
+    if total == 0:
+        return base
+    top_tags = run(
+        f"""
+        SELECT jt.tag AS tag, COUNT(*) AS cnt
+        FROM feedback_app fa,
+             JSON_TABLE(fa.tags, '$[*]' COLUMNS(tag VARCHAR(64) PATH '$')) jt
+        {where_sql.replace('feedback_app', 'fa')}
+        GROUP BY jt.tag
+        ORDER BY cnt DESC, jt.tag ASC
+        LIMIT 10
+        """,
+        tuple(params),
+        fetch="all",
+    ) or []
+    base["top_tags"] = [{"tag": r["tag"], "count": int(r["cnt"])} for r in top_tags]
+    return base
+
+
+# -------------------------------------------------------------------
+# Async job helpers tied to feedback stats
+# -------------------------------------------------------------------
+JOB_STORE: Dict[str, Dict[str, Any]] = {}
+JOB_LOCK = threading.Lock()
+
+
+def build_job_links(job_id: str) -> Dict[str, str]:
+    return {
+        "self": make_relative_url(f"/feedback/jobs/{job_id}"),
+        "collection": ensure_relative_path("/feedback/jobs"),
+    }
+
+
+def snapshot_job(job_id: str) -> Optional[Dict[str, Any]]:
+    with JOB_LOCK:
+        record = JOB_STORE.get(job_id)
+        if not record:
+            return None
+        return record.copy()
+
+
+def job_record_to_out(record: Dict[str, Any]) -> FeedbackAnalysisJobStatus:
+    target = UUID(record["target_id"]) if record.get("target_id") else None
+    return FeedbackAnalysisJobStatus(
+        id=UUID(record["id"]),
+        job_type=record["job_type"],
+        target_id=target,
+        tags=record.get("tags"),
+        since=record.get("since"),
+        status=record["status"],
+        result=record.get("result"),
+        error=record.get("error"),
+        created_at=record["created_at"],
+        updated_at=record["updated_at"],
+        completed_at=record.get("completed_at"),
+        links=build_job_links(record["id"]),
+    )
+
+
+def create_job_record(payload: FeedbackAnalysisJobRequest) -> Dict[str, Any]:
+    job_id = str(uuid4())
+    now = datetime.utcnow()
+    record = {
+        "id": job_id,
+        "job_type": payload.job_type,
+        "target_id": str(payload.target_id) if payload.target_id else None,
+        "tags": payload.tags,
+        "since": payload.since,
+        "status": "pending",
+        "result": None,
+        "error": None,
+        "created_at": now,
+        "updated_at": now,
+        "completed_at": None,
+    }
+    with JOB_LOCK:
+        JOB_STORE[job_id] = record
+    return record
+
+
+def update_job(job_id: str, **fields) -> None:
+    with JOB_LOCK:
+        record = JOB_STORE.get(job_id)
+        if not record:
+            return
+        record.update(fields)
+        record["updated_at"] = datetime.utcnow()
+
+
+def process_job(job_id: str) -> None:
+    try:
+        update_job(job_id, status="running")
+        time.sleep(random.uniform(1.5, 3.0))
+        record = snapshot_job(job_id)
+        if not record:
+            return
+        job_type = record["job_type"]
+        tags = record.get("tags")
+        since = record.get("since")
+        if job_type == "profile_stats":
+            if not record.get("target_id"):
+                raise ValueError("profile_stats job missing target_id")
+            stats = gather_profile_stats_data(record["target_id"], since, tags)
+            summary = {
+                "message": f"Profile stats refreshed for {record['target_id']}",
+                "stats": stats,
+            }
+        else:
+            stats = gather_app_stats_data(tags, since)
+            summary = {
+                "message": "App-wide stats refreshed",
+                "stats": stats,
+            }
+        update_job(
+            job_id,
+            status="succeeded",
+            result=summary,
+            completed_at=datetime.utcnow(),
+            error=None,
+        )
+    except Exception as exc:
+        update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            completed_at=datetime.utcnow(),
+        )
+
 # -------------------------------------------------------------------
 # Schema bootstrap (id as CHAR(36), tags JSON)
 # -------------------------------------------------------------------
@@ -346,7 +604,7 @@ def row_to_app_out(r: dict) -> AppFeedbackOut:
 # PROFILE FEEDBACK (DB-backed)
 # -------------------------------------------------------------------
 @app.post("/feedback/profile", response_model=ProfileFeedbackOut, status_code=status.HTTP_201_CREATED)
-def create_profile_feedback(payload: ProfileFeedbackCreate):
+def create_profile_feedback(response: Response, payload: ProfileFeedbackCreate):
     now = datetime.utcnow()
     pid = str(uuid4())
     try:
@@ -374,6 +632,7 @@ def create_profile_feedback(payload: ProfileFeedbackCreate):
             raise HTTPException(status_code=409, detail="Feedback already exists for this (match_id, reviewer)")
         raise
     row = run("SELECT * FROM feedback_profile WHERE id=%s", (pid,), fetch="one")
+    response.headers["Location"] = make_relative_url(f"/feedback/profile/{pid}")
     return row_to_profile_out(row)
 
 @app.get("/feedback/profile/{id}", response_model=ProfileFeedbackOut)
@@ -511,87 +770,23 @@ def profile_feedback_stats(
     tags: Optional[str] = Query(default=None),
     since: Optional[datetime] = Query(default=None),
 ):
-    where, params = ["reviewee_profile_id=%s"], [str(reviewee_profile_id)]
-    if since: where.append("created_at >= %s"); params.append(since)
-    if tags:
-        tag_list = [t.strip().lower() for t in tags.split(",") if t.strip()]
-        if tag_list:
-            where.append("JSON_OVERLAPS(tags, CAST(%s AS JSON))")
-            params.append(str(tag_list).replace("'", '"'))
-    where_sql = "WHERE " + " AND ".join(where)
-
-    agg = run(
-        f"""
-        SELECT
-          COUNT(*) AS total,
-          AVG(overall_experience) AS avg_overall,
-          SUM(overall_experience=1) AS d1,
-          SUM(overall_experience=2) AS d2,
-          SUM(overall_experience=3) AS d3,
-          SUM(overall_experience=4) AS d4,
-          SUM(overall_experience=5) AS d5,
-          AVG(NULLIF(safety_feeling,0)) AS avg_safety,
-          AVG(NULLIF(respectfulness,0)) AS avg_respect
-        FROM feedback_profile
-        {where_sql}
-        """,
-        tuple(params),
-        fetch="one",
-    )
-
-    total = agg["total"] or 0
+    tag_list = parse_tags_param(tags)
+    stats = gather_profile_stats_data(str(reviewee_profile_id), since, tag_list)
+    total = stats["count_total"]
     query_items = query_items_from_request(request)
     stats_links = {
         "self": make_relative_url(request.url.path, query_items),
         "related_feedback": make_relative_url("/feedback/profile", query_items),
     }
-    if total == 0:
-        return {
-            "reviewee_profile_id": reviewee_profile_id,
-            "count_total": 0,
-            "avg_overall_experience": None,
-            "distribution_overall_experience": {str(k): 0 for k in range(1,6)},
-            "facet_averages": {"safety_feeling": None, "respectfulness": None},
-            "top_tags": [],
-            "links": stats_links,
-        }
-
-    # Top tags via JSON_TABLE (MySQL 8+)
-    top_tags = run(
-        f"""
-        SELECT jt.tag AS tag, COUNT(*) AS cnt
-        FROM feedback_profile fp,
-             JSON_TABLE(fp.tags, '$[*]' COLUMNS(tag VARCHAR(64) PATH '$')) jt
-        {where_sql.replace('feedback_profile', 'fp')}
-        GROUP BY jt.tag
-        ORDER BY cnt DESC, jt.tag ASC
-        LIMIT 10
-        """,
-        tuple(params),
-        fetch="all",
-    ) or []
-
-    return {
-        "reviewee_profile_id": reviewee_profile_id,
-        "count_total": int(total),
-        "avg_overall_experience": round(float(agg["avg_overall"]), 3) if agg["avg_overall"] is not None else None,
-        "distribution_overall_experience": {
-            "1": int(agg["d1"] or 0), "2": int(agg["d2"] or 0), "3": int(agg["d3"] or 0),
-            "4": int(agg["d4"] or 0), "5": int(agg["d5"] or 0)
-        },
-        "facet_averages": {
-            "safety_feeling": round(float(agg["avg_safety"]), 3) if agg["avg_safety"] is not None else None,
-            "respectfulness": round(float(agg["avg_respect"]), 3) if agg["avg_respect"] is not None else None,
-        },
-        "top_tags": [{"tag": r["tag"], "count": int(r["cnt"])} for r in top_tags],
-        "links": stats_links,
-    }
+    stats["reviewee_profile_id"] = reviewee_profile_id
+    stats["links"] = stats_links
+    return stats
 
 # -------------------------------------------------------------------
 # APP FEEDBACK (DB-backed)
 # -------------------------------------------------------------------
 @app.post("/feedback/app", response_model=AppFeedbackOut, status_code=status.HTTP_201_CREATED)
-def create_app_feedback(payload: AppFeedbackCreate):
+def create_app_feedback(response: Response, payload: AppFeedbackCreate):
     now = datetime.utcnow()
     fid = str(uuid4())
     run(
@@ -610,6 +805,7 @@ def create_app_feedback(payload: AppFeedbackCreate):
         ),
     )
     row = run("SELECT * FROM feedback_app WHERE id=%s", (fid,), fetch="one")
+    response.headers["Location"] = make_relative_url(f"/feedback/app/{fid}")
     return row_to_app_out(row)
 
 @app.get("/feedback/app/{id}", response_model=AppFeedbackOut)
@@ -790,81 +986,36 @@ def app_feedback_stats(
     tags: Optional[str] = Query(default=None),
     since: Optional[datetime] = Query(default=None),
 ):
-    where, params = [], []
-    if since: where.append("created_at >= %s"); params.append(since)
-    if tags:
-        tag_list = [t.strip().lower() for t in tags.split(",") if t.strip()]
-        if tag_list:
-            where.append("JSON_OVERLAPS(tags, CAST(%s AS JSON))")
-            params.append(str(tag_list).replace("'", '"'))
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-
-    agg = run(
-        f"""
-        SELECT
-          COUNT(*) AS total,
-          AVG(overall) AS avg_overall,
-          SUM(overall=1) AS d1,
-          SUM(overall=2) AS d2,
-          SUM(overall=3) AS d3,
-          SUM(overall=4) AS d4,
-          SUM(overall=5) AS d5,
-          AVG(NULLIF(usability,0)) AS avg_usability,
-          AVG(NULLIF(reliability,0)) AS avg_reliability,
-          AVG(NULLIF(performance,0)) AS avg_performance,
-          AVG(NULLIF(support_experience,0)) AS avg_support
-        FROM feedback_app
-        {where_sql}
-        """,
-        tuple(params),
-        fetch="one",
-    )
-    total = agg["total"] or 0
+    tag_list = parse_tags_param(tags)
+    stats = gather_app_stats_data(tag_list, since)
+    total = stats["count_total"]
     query_items = query_items_from_request(request)
     stats_links = {
         "self": make_relative_url(request.url.path, query_items),
         "related_feedback": make_relative_url("/feedback/app", query_items),
     }
-    if total == 0:
-        return {
-            "count_total": 0,
-            "avg_overall": None,
-            "distribution_overall": {str(k): 0 for k in range(1,6)},
-            "facet_averages": {"usability": None, "reliability": None, "performance": None, "support_experience": None},
-            "top_tags": [],
-            "links": stats_links,
-        }
+    stats["links"] = stats_links
+    return stats
 
-    top_tags = run(
-        f"""
-        SELECT jt.tag AS tag, COUNT(*) AS cnt
-        FROM feedback_app fa,
-             JSON_TABLE(fa.tags, '$[*]' COLUMNS(tag VARCHAR(64) PATH '$')) jt
-        {where_sql.replace('feedback_app', 'fa')}
-        GROUP BY jt.tag
-        ORDER BY cnt DESC, jt.tag ASC
-        LIMIT 10
-        """,
-        tuple(params),
-        fetch="all",
-    ) or []
+@app.post("/feedback/jobs", response_model=FeedbackAnalysisJobStatus, status_code=status.HTTP_202_ACCEPTED)
+def enqueue_feedback_job(
+    payload: FeedbackAnalysisJobRequest,
+    response: Response,
+    background_tasks: BackgroundTasks,
+):
+    record = create_job_record(payload)
+    background_tasks.add_task(process_job, record["id"])
+    location = make_relative_url(f"/feedback/jobs/{record['id']}")
+    response.headers["Location"] = location
+    return job_record_to_out(record)
 
-    return {
-        "count_total": int(total),
-        "avg_overall": round(float(agg["avg_overall"]), 3) if agg["avg_overall"] is not None else None,
-        "distribution_overall": {
-            "1": int(agg["d1"] or 0), "2": int(agg["d2"] or 0), "3": int(agg["d3"] or 0),
-            "4": int(agg["d4"] or 0), "5": int(agg["d5"] or 0)
-        },
-        "facet_averages": {
-            "usability": round(float(agg["avg_usability"]), 3) if agg["avg_usability"] is not None else None,
-            "reliability": round(float(agg["avg_reliability"]), 3) if agg["avg_reliability"] is not None else None,
-            "performance": round(float(agg["avg_performance"]), 3) if agg["avg_performance"] is not None else None,
-            "support_experience": round(float(agg["avg_support"]), 3) if agg["avg_support"] is not None else None,
-        },
-        "top_tags": [{"tag": r["tag"], "count": int(r["cnt"])} for r in top_tags],
-        "links": stats_links,
-    }
+
+@app.get("/feedback/jobs/{job_id}", response_model=FeedbackAnalysisJobStatus)
+def get_feedback_job(job_id: UUID = Path(...)):
+    record = snapshot_job(str(job_id))
+    if not record:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job_record_to_out(record)
 
 # -------------------------------------------------------------------
 # Entrypoint
