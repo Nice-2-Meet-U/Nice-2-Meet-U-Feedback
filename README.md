@@ -10,6 +10,14 @@ API service for collecting and querying both profile-to-profile and app-level fe
 
 On startup the service will auto-create the `feedback_profile` and `feedback_app` tables if they do not exist.
 
+## Docker
+- **Build:** `docker build -t feedback-service .`
+- **Run (port 8001):** `docker run --env-file .env -e FASTAPIPORT=8001 -p 8001:8001 feedback-service`
+- Override `FASTAPIPORT` to use a different container/host port (update both `-p` mapping and env var).
+- **Compose (API + DB):** `FASTAPIPORT=8001 DB_PORT=3310 docker compose up --build`
+- App connects to DB via service name `db` on port 3306 inside the network; host port is `DB_PORT` (default 3310). If you already have MySQL on the host, pick an unused `DB_PORT`.
+- Compose waits for the DB healthcheck before starting the app (first start may take a few seconds).
+
 ## Data Model Highlights
 - **feedback_profile**
   - Captures reviewer→reviewee meeting feedback.
