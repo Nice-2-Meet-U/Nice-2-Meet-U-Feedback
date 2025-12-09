@@ -4,17 +4,15 @@ services:
     env_file:
       - .env
     environment:
-      DB_HOST: db          # override host for in-network access
-      DB_PORT: 3306        # container port
+      DB_HOST: "${DB_HOST:-db}"   # use external host when provided, default to local db
+      DB_PORT: "${DB_PORT:-3306}" # respect provided port, default to container port
       FASTAPIPORT: "${FASTAPIPORT:-8001}"
     ports:
       - "${FASTAPIPORT:-8001}:${FASTAPIPORT:-8001}"
-    depends_on:
-      db:
-        condition: service_healthy
 
   db:
     image: mysql:8
+    profiles: ["local-db"] # only starts when profile is enabled (for local dev)
     container_name: feedback-db
     environment:
       MYSQL_ROOT_PASSWORD: "${DB_PASSWORD:-devpass}"
