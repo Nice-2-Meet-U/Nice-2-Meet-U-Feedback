@@ -997,6 +997,51 @@ def app_feedback_stats(
     stats["links"] = stats_links
     return stats
 
+# Register prefixless aliases for deployments that strip the "/feedback" prefix
+app.add_api_route(
+    "/app",
+    create_app_feedback,
+    methods=["POST"],
+    response_model=AppFeedbackOut,
+    status_code=status.HTTP_201_CREATED,
+    include_in_schema=False,
+)
+app.add_api_route(
+    "/app/{id}",
+    get_app_feedback,
+    methods=["GET"],
+    response_model=AppFeedbackOut,
+    include_in_schema=False,
+)
+app.add_api_route(
+    "/app/{id}",
+    update_app_feedback,
+    methods=["PATCH"],
+    response_model=AppFeedbackOut,
+    include_in_schema=False,
+)
+app.add_api_route(
+    "/app/{id}",
+    delete_app_feedback,
+    methods=["DELETE"],
+    status_code=status.HTTP_204_NO_CONTENT,
+    include_in_schema=False,
+)
+app.add_api_route(
+    "/app",
+    list_app_feedback,
+    methods=["GET"],
+    response_model=Dict[str, object],
+    include_in_schema=False,
+)
+app.add_api_route(
+    "/app/stats",
+    app_feedback_stats,
+    methods=["GET"],
+    response_model=Dict[str, object],
+    include_in_schema=False,
+)
+
 @app.post("/feedback/jobs", response_model=FeedbackAnalysisJobStatus, status_code=status.HTTP_202_ACCEPTED)
 def enqueue_feedback_job(
     payload: FeedbackAnalysisJobRequest,
